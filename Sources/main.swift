@@ -14,7 +14,7 @@ typealias PGresult = OpaquePointer!
 
 public class CXN: PG {
     let cxn: PGconn
-    let lk = NSRecursiveLock()
+    let lk = RecursiveLock()
     var tx = false
 
     init(_ conninfo: String) {
@@ -38,8 +38,8 @@ public class CXN: PG {
         return try safely { pg in
             if !tx {
                 tx = true
-                direct("BEGIN;")
-                defer { direct("END;") }
+                _ = direct("BEGIN;")
+                defer { _ = direct("END;") }
             }
             return try task(pg)
         }
