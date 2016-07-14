@@ -4,7 +4,7 @@ import Foundation
 import CLibPQ
 
 
-func libVersion() -> Int32 {
+public func libVersion() -> Int32 {
     return PQlibVersion()
 }
 
@@ -16,7 +16,8 @@ public class Conn {
         DispatchQueue(label: "com.github.solidsnack.DispatchPQ")
 
     static func connectdb(_ conninfo: String) throws -> Conn {
-        guard let url = URL(string: conninfo) else { throw Error.badURL }
+        let s = conninfo == "" ? "postgres:///" : conninfo
+        guard let url = URL(string: s) else { throw Error.badURL }
         return try connectdb(url)
     }
 
@@ -42,37 +43,61 @@ public class Conn {
         }
     }
 
+    func status() -> ConnStatusType {
+        return queue.sync { PQstatus(cxn) }
+    }
+
+
     // Synchronous interfaces. Always casts to Result.
 
     private func sync(f: @noescape () -> OpaquePointer!) -> Result {
         return Result(queue.sync(execute: f))
     }
 
+    /// Execute a query and return the results. It is possible to pass
+    /// multiple independent queries in one go, although only the last result
+    /// will be returned.
+    /// Any errors will be found in the `Result` object.
     func exec(_ query: String) -> Result {
         return sync { PQexec(cxn, query) }
     }
 
-    func exec(_ query: String, params: Array<String?>) -> Result {
+    /// Execute a query with parameters. Only one query may be sent.
+    /// Any errors will be found in the `Result` object.
+    func exec(_ query: String, _ params: Array<String?>) -> Result {
         let (len, pointers) = pointerize(params)
         return sync {
             PQexecParams(cxn, query, len, nil, pointers, nil, nil, 0)
         }
     }
 
-    func exec(statement: String, params: Array<String?> = []) -> Result {
+    /// Execute a prepared statement and return the results.
+    /// Any errors will be found in the `Result` object.
+    func exec(statement: String, _ params: Array<String?> = []) -> Result {
         let (len, pointers) = pointerize(params)
         return sync {
             PQexecPrepared(cxn, statement, len, pointers, nil, nil, 0)
         }
     }
 
-    func exec(prepare: String, query: String) -> Result {
-        return sync { PQprepare(cxn, prepare, query, 0, nil) }
+    /// Create a preprated statement.
+    /// Any errors will be found in the `Result` object.
+    func prepare(statement: String, _ query: String) -> Result {
+        return sync { PQprepare(cxn, statement, query, 0, nil) }
     }
 
-    func exec(describe: String) -> Result {
-        return sync { PQdescribePrepared(cxn, describe) }
+    /// Describe a preprated statement.
+    /// Any errors will be found in the `Result` object.
+    func describe(statement: String) -> Result {
+        return sync { PQdescribePrepared(cxn, statement) }
     }
+
+    /// Describe a portal (cursor).
+    /// Any errors will be found in the `Result` object.
+    func describe(portal: String) -> Result {
+        return sync { PQdescribePortal(cxn, portal) }
+    }
+
 
     // Async interfaces. Always checks error code and throws.
 
@@ -83,30 +108,41 @@ public class Conn {
         }
     }
 
-    func send(_ query: String) throws {
+    /// With `.send`, performs the query asynchronously.
+    func exec(_ query: String, _ send: Send) throws {
         try async { PQsendQuery(cxn, query) }
     }
 
-    func send(_ query: String, params: Array<String?>) throws {
+    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
+    func exec(_ query: String, _ params: Array<String?>, _ send: Send) throws {
         let (len, pointers) = pointerize(params)
         try async {
             PQsendQueryParams(cxn, query, len, nil, pointers, nil, nil, 0)
         }
     }
 
-    func send(statement: String, params: Array<String?> = []) throws {
+    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
+    func exec(statement: String, _ params: Array<String?> = [],
+              _ send: Send) throws {
         let (len, pointers) = pointerize(params)
         try async {
             PQsendQueryPrepared(cxn, statement, len, pointers, nil, nil, 0)
         }
     }
 
-    func send(prepare: String, query: String) throws {
-        try async { PQsendPrepare(cxn, prepare, query, 0, nil) }
+    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
+    func prepare(statement: String, _ query: String, _ send: Send) throws {
+        try async { PQsendPrepare(cxn, statement, query, 0, nil) }
     }
 
-    func send(describe: String) throws {
-        try async { PQsendDescribePrepared(cxn, describe) }
+    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
+    func describe(statement: String, _ send: Send) throws {
+        try async { PQsendDescribePrepared(cxn, statement) }
+    }
+
+    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
+    func describe(portal: String, _ send: Send) throws {
+        try async { PQsendDescribePortal(cxn, portal) }
     }
 
     /// Return `Result` objects till we have processed everything.
@@ -130,6 +166,9 @@ public class Conn {
         }
     }
 }
+
+
+public enum Send { case send }
 
 
 class Result {
@@ -205,43 +244,10 @@ private func pointerize(_ params: Array<String?> = [])
             params.map({ s in s?.withCString { $0 } }))
 }
 
-//let cxn = CXN("")
-///// let res = cxn.exec("SELECT now();")
-//
-//print("Rows: \(res.rows)")
-//print("Status: \(res.status.message)")
-//print("CXN: \(PQstatus(cxn.cxn))")
-//print("CONNECTION_OK: \(CONNECTION_OK)")
-//print("CONNECTION_BAD: \(CONNECTION_BAD)")
 
+let conn = try Conn.connectdb("")
+let res = conn.exec("SELECT now();")
 
-//internal func direct(_ query: String,
-//                     params: Array<String?> = []) -> PGresult {
-//    let pointers = params.map { s in s?.withCString { $0 } }
-//    let len = Int32(pointers.count)
-//    return PQexecParams(cxn, query, len, nil, pointers, nil, nil, 0)
-//    PQexec
-//}
-//
-//
-//func exec<T>(_ task: @noescape (PG) throws -> T) rethrows -> T {
-//    return try safely { pg in
-//        if !tx {
-//            tx = true
-//            _ = direct("BEGIN;")
-//            defer { _ = direct("END;") }
-//        }
-//        return try task(pg)
-//    }
-//}
-//
-//func exec(_ s: String) -> Result {
-//    return safely { _ in Result(direct(s)) }
-//}
-//
-//protocol PG {
-//    func exec(_ query: String) -> Result
-//}
-//
-//
-
+print("Connection: \(conn.conninfo) \(conn.status().name)")
+print("Rows: \(res.rows)")
+print("Status: \(res.status.message)")
