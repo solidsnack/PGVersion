@@ -12,7 +12,7 @@ public func libVersion() -> Int32 {
 public class Conn {
     let conninfo: URL
     private let cxn: OpaquePointer!
-    private var queue =
+    private let queue =
         DispatchQueue(label: "com.github.solidsnack.DispatchPQ")
 
     static func connectdb(_ conninfo: String) throws -> Conn {
