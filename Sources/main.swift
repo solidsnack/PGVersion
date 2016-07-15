@@ -11,171 +11,174 @@ public func libVersion() -> Int32 {
 
 public class Conn {
     let conninfo: URL
+
     private let cxn: OpaquePointer!
-    private let queue =
+    private let queue: DispatchQueue =
         DispatchQueue(label: "com.github.solidsnack.DispatchPQ")
 
-    static func connectdb(_ conninfo: String) throws -> Conn {
-        let s = conninfo == "" ? "postgres:///" : conninfo
-        guard let url = URL(string: s) else { throw Error.badURL }
-        return try connectdb(url)
-    }
+    private var clientThread: pthread_t? = nil
+    private var cookie: Int = 0
 
-    static func connectdb(_ conninfo: URL) throws -> Conn {
-        let cxn = PQconnectdb(conninfo.relativeString)
-        if PQstatus(cxn) != CONNECTION_OK { throw Error.probe(cxn: cxn) }
-        return Conn(cxn, url: conninfo)
-    }
-
-    init(_ underlyingStruct: OpaquePointer!, url: URL) {
-        cxn = underlyingStruct
-        conninfo = url
+    init(_ conninfo: URL, cxn: OpaquePointer!) {
+        self.cxn = cxn
+        self.conninfo = conninfo
     }
 
     deinit {
         PQfinish(cxn)
     }
 
+    convenience init(_ conninfo: String) throws {
+        let s = conninfo == "" ? "postgres:///" : conninfo
+        guard let url = URL(string: s) else { throw Error.badURL }
+        try self.init(url)
+    }
+
+    convenience init(_ conninfo: URL) throws {
+        let cxn = PQconnectdb(conninfo.relativeString)
+        if PQstatus(cxn) != CONNECTION_OK { throw Error.probe(cxn: cxn) }
+        self.init(conninfo, cxn: cxn)
+    }
+
+    // The usual interfaces, sync and async.
+
+    func exec(_ op: Op) -> Result {
+        return sync {
+            switch op {
+            case let .query(text):
+                return PQexec(cxn, text)
+            case let .queryParams(text, params):
+                let (len, arr) = pointerize(params)
+                return PQexecParams(cxn, text, len, nil, arr, nil, nil, 0)
+            case let .prepare(statement, text):
+                return PQprepare(cxn, statement, text, 0, nil)
+            case let .execPrepared(statement, params):
+                let (len, arr) = pointerize(params)
+                return PQexecPrepared(cxn, statement, len, arr, nil, nil, 0)
+            case let .describePrepared(statement):
+                return PQdescribePrepared(cxn, statement)
+            case let .describePortal(portal):
+                return PQdescribePortal(cxn, portal)
+            }
+        }
+    }
+
+    func exec(_ query: String, _ params: Array<String?> = []) -> Result {
+        return exec(.queryParams(query, params))
+    }
+
+    func send(_ op: Op) throws {
+        try async {
+            switch op {
+            case let .query(text):
+                return PQsendQuery(cxn, text)
+            case let .queryParams(text, params):
+                let (len, arr) = pointerize(params)
+                return PQsendQueryParams(cxn, text, len, nil, arr, nil, nil, 0)
+            case let .prepare(statement, text):
+                return PQsendPrepare(cxn, statement, text, 0, nil)
+            case let .execPrepared(s, params):
+                let (len, arr) = pointerize(params)
+                return PQsendQueryPrepared(cxn, s, len, arr, nil, nil, 0)
+            case let .describePrepared(statement):
+                return PQsendDescribePrepared(cxn, statement)
+            case let .describePortal(portal):
+                return PQsendDescribePortal(cxn, portal)
+            }
+        }
+    }
+
+    func send(_ query: String, _ params: Array<String?> = []) throws {
+        try send(.queryParams(query, params))
+    }
+
+    /// Safely access the connection for multiple operations. While the
+    /// closure parameter is running, no other threads may access the
+    /// connection. This prevents threads from interleaving statements when
+    /// running multi-step operations.
+    func with<T>(block: @noescape () throws -> T) rethrows -> T {
+        let me = pthread_self()
+        if let t = clientThread where t == me {
+            // We are in the thread and it is blocking on this code, so...
+            return try block()
+        } else {
+            return try queue.sync {
+                clientThread = me
+                cookie = Date().hashValue             // TODO: Better technique
+                defer { clientThread = nil }
+                return try block()
+            }
+        }
+    }
+
+
+    // Synchronous interfaces return `PGresult` (i.e., `OpaquePointer!`).
+    private func sync(block: @noescape () -> OpaquePointer!) -> Result {
+        return Result(with { block() })
+    }
+
+    // Async interfaces return an error code.
+    private func async(streaming: Bool = true,
+                       block: @noescape () -> Int32) throws {
+        try with {
+            if 0 == block() { throw Error.probe(cxn: cxn) }
+            if streaming { PQsetSingleRowMode(cxn) }
+        }
+    }
+
     func reset() throws {
-        try queue.sync {
+        try with {
             PQreset(cxn)
-            if PQstatus(cxn) != CONNECTION_OK { throw Error.probe(cxn: cxn) }
+            try check()
         }
     }
 
     func status() -> ConnStatusType {
-        return queue.sync { PQstatus(cxn) }
+        return with { PQstatus(cxn) }
     }
 
-
-    // Synchronous interfaces. Always casts to Result.
-
-    private func sync(f: @noescape () -> OpaquePointer!) -> Result {
-        return Result(queue.sync(execute: f))
+    func check() throws {
+        if status() != CONNECTION_OK { throw Error.probe(cxn: cxn) }
     }
 
-    /// Execute a query and return the results. It is possible to pass
-    /// multiple independent queries in one go, although only the last result
-    /// will be returned.
-    /// Any errors will be found in the `Result` object.
-    func exec(_ query: String) -> Result {
-        return sync { PQexec(cxn, query) }
+    func consumeInput() throws {
+        try async(streaming: false) { PQconsumeInput(cxn) }
     }
 
-    /// Execute a query with parameters. Only one query may be sent.
-    /// Any errors will be found in the `Result` object.
-    func exec(_ query: String, _ params: Array<String?>) -> Result {
-        let (len, pointers) = pointerize(params)
-        return sync {
-            PQexecParams(cxn, query, len, nil, pointers, nil, nil, 0)
+    func busy() throws -> Bool {
+        return try with {
+            try consumeInput()
+            return 0 != PQisBusy(cxn)
         }
-    }
-
-    /// Execute a prepared statement and return the results.
-    /// Any errors will be found in the `Result` object.
-    func exec(statement: String, _ params: Array<String?> = []) -> Result {
-        let (len, pointers) = pointerize(params)
-        return sync {
-            PQexecPrepared(cxn, statement, len, pointers, nil, nil, 0)
-        }
-    }
-
-    /// Create a preprated statement.
-    /// Any errors will be found in the `Result` object.
-    func prepare(statement: String, _ query: String) -> Result {
-        return sync { PQprepare(cxn, statement, query, 0, nil) }
-    }
-
-    /// Describe a preprated statement.
-    /// Any errors will be found in the `Result` object.
-    func describe(statement: String) -> Result {
-        return sync { PQdescribePrepared(cxn, statement) }
-    }
-
-    /// Describe a portal (cursor).
-    /// Any errors will be found in the `Result` object.
-    func describe(portal: String) -> Result {
-        return sync { PQdescribePortal(cxn, portal) }
-    }
-
-
-    // Async interfaces. Always checks error code and throws.
-
-    private func async(stream: Bool = true, f: @noescape () -> Int32) throws {
-        try queue.sync {
-            if 0 == f() { throw Error.probe(cxn: cxn) }
-            if stream { PQsetSingleRowMode(cxn) }
-        }
-    }
-
-    /// With `.send`, performs the query asynchronously.
-    func exec(_ query: String, _ send: Send) throws {
-        try async { PQsendQuery(cxn, query) }
-    }
-
-    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
-    func exec(_ query: String, _ params: Array<String?>, _ send: Send) throws {
-        let (len, pointers) = pointerize(params)
-        try async {
-            PQsendQueryParams(cxn, query, len, nil, pointers, nil, nil, 0)
-        }
-    }
-
-    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
-    func exec(statement: String, _ params: Array<String?> = [],
-              _ send: Send) throws {
-        let (len, pointers) = pointerize(params)
-        try async {
-            PQsendQueryPrepared(cxn, statement, len, pointers, nil, nil, 0)
-        }
-    }
-
-    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
-    func prepare(statement: String, _ query: String, _ send: Send) throws {
-        try async { PQsendPrepare(cxn, statement, query, 0, nil) }
-    }
-
-    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
-    func describe(statement: String, _ send: Send) throws {
-        try async { PQsendDescribePrepared(cxn, statement) }
-    }
-
-    /// With `.send`, uses the `PQsend*` (asynchronous) variant.
-    func describe(portal: String, _ send: Send) throws {
-        try async { PQsendDescribePortal(cxn, portal) }
     }
 
     /// Return `Result` objects till we have processed everything.
     func getResult() -> Result? {
-        return queue.sync {
-            if let data: OpaquePointer = PQgetResult(cxn) {
-                return Result(data)
-            }
-            return nil
-        }
-    }
-
-    func consumeInput() throws {
-        try async(stream: false) { PQconsumeInput(cxn) }
-    }
-
-    func busy() throws -> Bool {
-        return try queue.sync {
-            if 0 == PQconsumeInput(cxn) { throw Error.probe(cxn: cxn) }
-            return 0 != PQisBusy(cxn)
-        }
+        let data: OpaquePointer? = with { PQgetResult(cxn) }
+        return data.map { Result($0) }
     }
 }
 
 
-public enum Send { case send }
+enum Op {
+    case query(String)
+    case queryParams(String, Array<String?>)
+    case prepare(String, String)
+    case execPrepared(String, Array<String?>)
+    case describePrepared(String)
+    case describePortal(String)
+}
 
 
-class Result {
+public class Result {
     private let res: OpaquePointer!
 
     private init(_ underlyingStruct: OpaquePointer) {
         res = underlyingStruct
+    }
+
+    private init(block: @noescape () -> OpaquePointer!) {
+        res = block()
     }
 
     deinit {
@@ -201,14 +204,23 @@ class Result {
     }
 }
 
-enum Error : ErrorProtocol {
+public enum Error : ErrorProtocol {
     /// Unstructured message that is sometimes the only thing available.
     case message(String)
     /// Bad URL parse for conninfo URL.
     case badURL
+    case staleResultsCookie
 
+    /// Retrieve error data from connection.
     private static func probe(cxn: OpaquePointer!) -> Error {
         return Error.message(String(cString: PQerrorMessage(cxn)))
+    }
+
+    /// Translate PQ error handling idiom to `throw`.
+    private static func check(_ cxn: OpaquePointer!,
+                              block: @noescape () -> Int32) throws {
+        if block() != 0 { return }
+        throw Error.message(String(cString: PQerrorMessage(cxn)))
     }
 }
 
@@ -232,7 +244,7 @@ extension ConnStatusType {
             case CONNECTION_SETENV: return "CONNECTION_SETENV"
             case CONNECTION_SSL_STARTUP: return "CONNECTION_SSL_STARTUP"
             case CONNECTION_NEEDED: return "CONNECTION_NEEDED"
-            default: return "CONNECTION_UNKNOWN"
+            default: return "CONNECTION_STATUS_\(self.rawValue)"
             }
         }
     }
@@ -245,7 +257,7 @@ private func pointerize(_ params: Array<String?> = [])
 }
 
 
-let conn = try Conn.connectdb("")
+let conn = try Conn("")
 let res = conn.exec("SELECT now();")
 
 print("Connection: \(conn.conninfo) \(conn.status().name)")
