@@ -42,6 +42,7 @@ public class Conn {
 
     // The usual interfaces, sync and async.
 
+    /// Synchronously perform various operations. A low-level interface.
     func exec(_ op: Op) -> Result {
         return sync {
             switch op {
@@ -63,10 +64,13 @@ public class Conn {
         }
     }
 
+    /// Perform a single query, optionally with paremeters, and return the
+    /// result.
     func exec(_ query: String, _ params: Array<String?> = []) -> Result {
         return exec(.queryParams(query, params))
     }
 
+    /// Perform various operations in the background. A low-level interface.
     func send(_ op: Op) throws {
         try async {
             switch op {
@@ -88,6 +92,8 @@ public class Conn {
         }
     }
 
+    /// Send a single query, optionally with params, off to be executed in the
+    /// background.
     func send(_ query: String, _ params: Array<String?> = []) throws {
         try send(.queryParams(query, params))
     }
@@ -112,12 +118,12 @@ public class Conn {
     }
 
 
-    // Synchronous interfaces return `PGresult` (i.e., `OpaquePointer!`).
+    /// Synchronous interfaces return `PGresult` (i.e., `OpaquePointer!`).
     private func sync(block: @noescape () -> OpaquePointer!) -> Result {
         return Result(with { block() })
     }
 
-    // Async interfaces return an error code.
+    /// Async interfaces return an error code.
     private func async(streaming: Bool = true,
                        block: @noescape () -> Int32) throws {
         try with {
@@ -126,6 +132,7 @@ public class Conn {
         }
     }
 
+    /// Re-establishes a Postgres connection, using the existing options.
     func reset() throws {
         try with {
             PQreset(cxn)
@@ -133,18 +140,24 @@ public class Conn {
         }
     }
 
+    /// Returns the connection status, safely accessing the connection to do
+    /// so.
     func status() -> ConnStatusType {
         return with { PQstatus(cxn) }
     }
 
+    /// Throws if the connection is in an unhealthy state.
     func check() throws {
         if status() != CONNECTION_OK { throw Error.probe(cxn: cxn) }
     }
 
+    /// Retrieves buffered input from the underlying socket and stores it in a
+    /// staging area. This clears any relevant select/epoll/kqueue state.
     func consumeInput() throws {
         try async(streaming: false) { PQconsumeInput(cxn) }
     }
 
+    /// Determine if the connection is busy (processing an asynchronous query).
     func busy() throws -> Bool {
         return try with {
             try consumeInput()
