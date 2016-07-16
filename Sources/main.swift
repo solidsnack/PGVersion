@@ -199,21 +199,15 @@ public class Result {
     }
 
     var status: ExecStatusType {
-        get {
-            return PQresultStatus(res)
-        }
+        return PQresultStatus(res)
     }
 
     var err: String {
-        get {
-            return String(cString: PQresultErrorMessage(res))
-        }
+        return String(cString: PQresultErrorMessage(res))
     }
 
     var rows: Int32 {
-        get {
-            return PQntuples(res)
-        }
+        return PQntuples(res)
     }
 }
 
@@ -239,26 +233,24 @@ public enum Error : ErrorProtocol {
 
 extension ExecStatusType {
     var message: String {
-        get { return String(cString: PQresStatus(self)) }
+        return String(cString: PQresStatus(self))
     }
 }
 
 extension ConnStatusType {
     var name: String {
-        get {
-            switch self {
-            case CONNECTION_OK: return "CONNECTION_OK"
-            case CONNECTION_BAD: return "CONNECTION_BAD"
-            case CONNECTION_STARTED: return "CONNECTION_STARTED"
-            case CONNECTION_MADE: return "CONNECTION_MADE"
-            case CONNECTION_AWAITING_RESPONSE:
-                return "CONNECTION_AWAITING_RESPONSE"
-            case CONNECTION_AUTH_OK: return "CONNECTION_AUTH_OK"
-            case CONNECTION_SETENV: return "CONNECTION_SETENV"
-            case CONNECTION_SSL_STARTUP: return "CONNECTION_SSL_STARTUP"
-            case CONNECTION_NEEDED: return "CONNECTION_NEEDED"
-            default: return "CONNECTION_STATUS_\(self.rawValue)"
-            }
+        switch self {
+        case CONNECTION_OK: return "CONNECTION_OK"
+        case CONNECTION_BAD: return "CONNECTION_BAD"
+        case CONNECTION_STARTED: return "CONNECTION_STARTED"
+        case CONNECTION_MADE: return "CONNECTION_MADE"
+        case CONNECTION_AWAITING_RESPONSE:
+            return "CONNECTION_AWAITING_RESPONSE"
+        case CONNECTION_AUTH_OK: return "CONNECTION_AUTH_OK"
+        case CONNECTION_SETENV: return "CONNECTION_SETENV"
+        case CONNECTION_SSL_STARTUP: return "CONNECTION_SSL_STARTUP"
+        case CONNECTION_NEEDED: return "CONNECTION_NEEDED"
+        default: return "CONNECTION_STATUS_\(self.rawValue)"
         }
     }
 }
