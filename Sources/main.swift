@@ -5,6 +5,18 @@ import CLibPQ
 import Result
 
 
+/// This library provides:
+///
+/// * A low-level, thread-safe interface to a single Postgres connection,
+///   providing access to most Postgres functionality.
+///
+/// * A higher-level convenience API for working with a Postgres connection in
+///   a safe way.
+///
+/// * A statement abstraction, to make it easier to work with prepared
+///   statements and model the database as an API provider.
+
+
 public func libVersion() -> Int32 {
     return PQlibVersion()
 }
@@ -44,17 +56,6 @@ public final class Connection {
         self.init(conninfo, cxn: cxn)
     }
 
-    func query(_ text: String, _ params: [String?] = []) throws -> Response {
-        try send(.sendQueryParams(text, params))
-        if let result = getResult() {
-            return result
-        } else {
-            throw Error.internalError(
-                "Query with no response should be impossible...this is a bug."
-            )
-        }
-    }
-
     /// Cancel whatever the connection is doing.
     func cancel() throws {
         try cancelToken.cancel()
@@ -63,7 +64,7 @@ public final class Connection {
     // TODO: copy (bulk load)
 //    func copy<C: Sequence, CC: Sequence
 //              where CC.Iterator.Element == C, C.Iterator.Element == String?>
-//        (_ rows: CC) -> [Response] {
+//        (_ rows: CC) -> [Rows] {
 //
 //    }
 
@@ -82,37 +83,6 @@ public final class Connection {
                 cookie = arc4random()
                 defer { clientThread = nil }
                 return try block()
-            }
-        }
-    }
-
-    /// Async interfaces return an error code.
-    private func async(streaming: Bool = true,
-                       block: @noescape () -> Int32) throws {
-        try with {
-            if 0 == block() { throw Error.probe(cxn: cxn) }
-            if streaming { PQsetSingleRowMode(cxn) }
-        }
-    }
-
-    /// Perform various operations in the background. A low-level interface.
-    func send(_ op: Send) throws {
-        try async {
-            switch op {
-            case let .sendQuery(text):
-                return PQsendQuery(cxn, text)
-            case let .sendQueryParams(text, params):
-                let (len, arr) = pointerize(params)
-                return PQsendQueryParams(cxn, text, len, nil, arr, nil, nil, 0)
-            case let .sendPrepare(statement, text):
-                return PQsendPrepare(cxn, statement, text, 0, nil)
-            case let .sendQueryPrepared(s, params):
-                let (len, arr) = pointerize(params)
-                return PQsendQueryPrepared(cxn, s, len, arr, nil, nil, 0)
-            case let .sendDescribePrepared(statement):
-                return PQsendDescribePrepared(cxn, statement)
-            case let .sendDescribePortal(portal):
-                return PQsendDescribePortal(cxn, portal)
             }
         }
     }
@@ -140,7 +110,9 @@ public final class Connection {
     /// Retrieves buffered input from the underlying socket and stores it in a
     /// staging area. This clears any relevant select/epoll/kqueue state.
     func consumeInput() throws {
-        try async(streaming: false) { PQconsumeInput(cxn) }
+        try with {
+            if PQconsumeInput(cxn) == 0 { throw Error.probe(cxn: cxn) }
+        }
     }
 
     /// Determine if the connection is busy (processing an asynchronous query).
@@ -159,14 +131,24 @@ public final class Connection {
         }
     }
 
-    /// Return `Rows` till we have processed everything.
-    func getResult() -> Response? {
+    /// Get the next batch of rows or throw if there was an error.
+    func rows() throws -> Rows? {
         let data: OpaquePointer? = with {
+            defer { processNotifications() }
             let ptr = PQgetResult(cxn)
-            processNotifications()                     // TODO: Background this
             return ptr
         }
-        return data.map { Response($0) }
+        let rows = data.map { Rows($0) }
+        try rows?.check()
+        return rows
+    }
+
+    /// Perform any low-level libpq operation that communicates with the
+    /// server.
+    func request<R: Request>(_ req: R) throws -> R.Response {
+        // Send pre event here.
+        return try req.call(self)
+        // Send post event here.
     }
 }
 
@@ -223,49 +205,150 @@ public final class Notification {
 
 /// A `Request` is something we forward to the server. Each request maps to a
 /// a function from `libpq`.
-protocol Request { }
+public protocol Request {
+    associatedtype Response
+
+    func call(_: Connection) throws -> Response
+}
 
 
 /// Synchronous API.
-enum Exec: Request {
+public enum Exec: Request {
+    public typealias Response = Rows
+
     case exec(String)
     case execParams(String, [String?])
     case prepare(String, String)
     case execPrepared(String, [String?])
     case describePrepared(String)
     case describePortal(String)
+
+    public func call(_ conn: Connection) throws -> Rows {
+        let rows = Rows(conn.with {
+            defer { conn.processNotifications() }
+            switch self {
+            case let .exec(text):
+                return PQexec(conn.cxn, text)
+            case let .execParams(text, params):
+                let (len, arr) = pointerize(params)
+                return PQexecParams(conn.cxn, text, len, nil, arr, nil, nil, 0)
+            case let .prepare(statement, text):
+                return PQprepare(conn.cxn, statement, text, 0, nil)
+            case let .execPrepared(s, params):
+                let (len, arr) = pointerize(params)
+                return PQexecPrepared(conn.cxn, s, len, arr, nil, nil, 0)
+            case let .describePrepared(statement):
+                return PQdescribePrepared(conn.cxn, statement)
+            case let .describePortal(portal):
+                return PQdescribePortal(conn.cxn, portal)
+            }
+        })
+        try rows.check()
+        return rows
+    }
 }
 
 
 /// Async query API.
-enum Send: Request {
+public enum Send: Request {
+    public typealias Response = ()
+
     case sendQuery(String)
     case sendQueryParams(String, [String?])
     case sendPrepare(String, String)
     case sendQueryPrepared(String, [String?])
     case sendDescribePrepared(String)
     case sendDescribePortal(String)
-}
 
-
-enum CopyFrom: Request {
-    case putCopyData([UInt8])
-    case putCopyEnd
-}
-
-
-enum CopyTo: Request {
-    case getCopyData
-
-    enum Status {
-        case tryAgain
-        case data([UInt8])
-        case finished
+    public func call(_ conn: Connection) throws {
+        try conn.with {
+            var result: Int32
+            switch self {
+            case let .sendQuery(text):
+                result = PQsendQuery(conn.cxn, text)
+            case let .sendQueryParams(text, params):
+                let (len, arr) = pointerize(params)
+                result = PQsendQueryParams(conn.cxn, text, len, nil,
+                                           arr, nil, nil, 0)
+            case let .sendPrepare(statement, text):
+                result = PQsendPrepare(conn.cxn, statement, text, 0, nil)
+            case let .sendQueryPrepared(s, params):
+                let (len, arr) = pointerize(params)
+                result = PQsendQueryPrepared(conn.cxn, s, len, arr,
+                                             nil, nil, 0)
+            case let .sendDescribePrepared(statement):
+                result = PQsendDescribePrepared(conn.cxn, statement)
+            case let .sendDescribePortal(portal):
+                result = PQsendDescribePortal(conn.cxn, portal)
+            }
+            if result == 0 { throw Error.probe(cxn: conn.cxn) }
+            PQsetSingleRowMode(conn.cxn)
+        }
     }
 }
 
 
-public final class Response {
+public enum CopyPut: Request {
+    public typealias Response = ()
+
+    case putCopyData([UInt8])
+    case putCopyEnd(forceFailureWith: String?)
+
+    public func call(_ conn: Connection) throws {
+        try conn.with {
+            var result: Int32
+            switch self {
+            case let .putCopyData(bytes):
+                let ptr: UnsafePointer<Int8> = UnsafePointer(bytes)
+                result = PQputCopyData(conn.cxn, ptr, Int32(bytes.count))
+            case let .putCopyEnd(msg):
+                result = PQputCopyEnd(conn.cxn, msg)
+            }
+            if result == -1 { throw Error.probe(cxn: conn.cxn) }
+        }
+    }
+}
+
+
+public enum CopyGet: Request {
+    public typealias Response = Status
+
+    case getCopyData(async: Bool)
+
+    public enum Status {
+        case tryAgain
+        case data([UInt8])
+        case finished
+    }
+
+    public func call(_ conn: Connection) throws -> Status {
+        return try conn.with {
+            var asyncFlag: Int32
+            switch self {
+            case let .getCopyData(async): asyncFlag = async ? 1 : 0
+            }
+            let size = sizeof(UnsafeMutablePointer<Int8>.self)
+            let buffer: UnsafeMutablePointer<UnsafeMutablePointer<Int8>?> =
+                UnsafeMutablePointer(allocatingCapacity: size)
+            switch PQgetCopyData(conn.cxn, buffer, asyncFlag) {
+            case -2: throw Error.probe(cxn: conn.cxn)
+            case -1: return Status.finished
+            case 0: return Status.tryAgain
+            case let n:
+                if let data = buffer.pointee {
+                    let ptr: UnsafePointer<UInt8> = UnsafePointer(data)
+                    let buf: UnsafeBufferPointer<UInt8> =
+                        UnsafeBufferPointer(start: ptr, count: Int(n))
+                    return Status.data(Array(buf))
+                }
+                return Status.tryAgain
+            }
+        }
+    }
+}
+
+
+public final class Rows {
     private let res: OpaquePointer!
 
     private init(_ underlyingStruct: OpaquePointer) {
@@ -317,9 +400,10 @@ public final class Response {
 
     func check() throws {
         let sqlStateField = Int32(("C".unicodeScalars.first?.value)!)
-        let sqlState = PQresultErrorField(res, sqlStateField)!
-        if err != "" {
-            throw Error.onRequest(err, sqlState: String(cString: sqlState))
+        if let sqlState = PQresultErrorField(res, sqlStateField) {
+            if err != "" {
+                throw Error.onRequest(err, sqlState: String(cString: sqlState))
+            }
         }
     }
 }
@@ -372,7 +456,7 @@ private func pointerize(_ params: Array<String?> = [])
 
 
 let conn = try Connection("")
-let res = try conn.query("SELECT now();")
+let res: Rows = try conn.request(Exec.exec("SELECT now();"))
 
 print("Connection: \(conn.conninfo) \(conn.status().name)")
 print("Rows: \(res.rows())")
