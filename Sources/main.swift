@@ -398,12 +398,17 @@ public final class Rows {
         return data
     }
 
+    func errorField(char: Character) -> String? {
+        let field = Int32((String(char).unicodeScalars.first?.value)!)
+        if let data = PQresultErrorField(res, field) {
+             return String(cString: data)
+        }
+        return nil
+    }
+
     func check() throws {
-        let sqlStateField = Int32(("C".unicodeScalars.first?.value)!)
-        if let sqlState = PQresultErrorField(res, sqlStateField) {
-            if err != "" {
-                throw Error.onRequest(err, sqlState: String(cString: sqlState))
-            }
+        if let sqlState = errorField(char: "C") {
+            throw Error.onRequest(err, sqlState: sqlState)
         }
     }
 }
