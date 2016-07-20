@@ -53,7 +53,11 @@ public final class Connection {
         self.init(conninfo, cxn: cxn)
     }
 
-    func query(_ text: String, params: [String?] = []) throws -> Rows {
+    func query(_ text: String, _ params: [String?] = []) throws -> Rows {
+        return try query(text, params.map { $0.map { .string($0) } ?? .null })
+    }
+
+    func query(_ text: String, _ params: [PGParam]) throws -> Rows {
         return try request(Exec.execParams(text, params))
     }
 
@@ -221,6 +225,16 @@ public final class Notification {
 }
 
 
+public enum PGParam {
+    case binary([UInt8])
+    case string(String)
+    case null
+}
+
+
+public protocol SQLParam {
+    func toPG() -> PGParam
+}
 
 
 /// A `Request` is something we forward to the server. Each request maps to a
@@ -237,9 +251,9 @@ public enum Exec: Request {
     public typealias Response = Rows
 
     case exec(String)
-    case execParams(String, [String?])
+    case execParams(String, [PGParam])
     case prepare(String, String)
-    case execPrepared(String, [String?])
+    case execPrepared(String, [PGParam])
     case describePrepared(String)
     case describePortal(String)
 
@@ -250,13 +264,17 @@ public enum Exec: Request {
             case let .exec(text):
                 return PQexec(conn.cxn, text)
             case let .execParams(text, params):
-                let (len, arr) = pointerize(params)
-                return PQexecParams(conn.cxn, text, len, nil, arr, nil, nil, 0)
+                let spec = pointerize(params)
+                return PQexecParams(conn.cxn, text, spec.params, nil,
+                                    spec.data, spec.lengths,
+                                    spec.formats, 0)
             case let .prepare(statement, text):
                 return PQprepare(conn.cxn, statement, text, 0, nil)
-            case let .execPrepared(s, params):
-                let (len, arr) = pointerize(params)
-                return PQexecPrepared(conn.cxn, s, len, arr, nil, nil, 0)
+            case let .execPrepared(statement, params):
+                let spec = pointerize(params)
+                return PQexecPrepared(conn.cxn, statement, spec.params,
+                                      spec.data, spec.lengths,
+                                      spec.formats, 0)
             case let .describePrepared(statement):
                 return PQdescribePrepared(conn.cxn, statement)
             case let .describePortal(portal):
@@ -274,9 +292,9 @@ public enum Send: Request {
     public typealias Response = ()
 
     case sendQuery(String)
-    case sendQueryParams(String, [String?])
+    case sendQueryParams(String, [PGParam])
     case sendPrepare(String, String)
-    case sendQueryPrepared(String, [String?])
+    case sendQueryPrepared(String, [PGParam])
     case sendDescribePrepared(String)
     case sendDescribePortal(String)
 
@@ -287,15 +305,17 @@ public enum Send: Request {
             case let .sendQuery(text):
                 result = PQsendQuery(conn.cxn, text)
             case let .sendQueryParams(text, params):
-                let (len, arr) = pointerize(params)
-                result = PQsendQueryParams(conn.cxn, text, len, nil,
-                                           arr, nil, nil, 0)
+                let spec = pointerize(params)
+                result = PQsendQueryParams(conn.cxn, text, spec.params, nil,
+                                           spec.data, spec.lengths,
+                                           spec.formats, 0)
             case let .sendPrepare(statement, text):
                 result = PQsendPrepare(conn.cxn, statement, text, 0, nil)
-            case let .sendQueryPrepared(s, params):
-                let (len, arr) = pointerize(params)
-                result = PQsendQueryPrepared(conn.cxn, s, len, arr,
-                                             nil, nil, 0)
+            case let .sendQueryPrepared(statement, params):
+                let spec = pointerize(params)
+                result = PQsendQueryPrepared(conn.cxn, statement, spec.params,
+                                             spec.data, spec.lengths,
+                                             spec.formats, 0)
             case let .sendDescribePrepared(statement):
                 result = PQsendDescribePrepared(conn.cxn, statement)
             case let .sendDescribePortal(portal):
@@ -476,10 +496,38 @@ extension ConnStatusType {
 }
 
 
-private func pointerize(_ params: Array<String?> = [])
-        -> (Int32, Array<UnsafePointer<Int8>?>) {
-    return (Int32(params.count),
-            params.map({ s in s?.withCString { $0 } }))
+
+struct PGExec {
+    let params: Int32
+    let data: [UnsafePointer<Int8>?]
+    let lengths: [Int32]
+    let formats: [Int32]
+}
+
+
+private func pointerize(_ params: Array<PGParam> = []) -> PGExec {
+    let count = Int32(params.count)
+    var data: [UnsafePointer<Int8>?] = []
+    var lengths: [Int32] = []
+    var formats: [Int32] = []
+    for param in params {
+        switch param {
+        case let .binary(b):
+            data += [UnsafePointer(b)]
+            lengths += [Int32(b.count)]
+            formats += [1]
+        case let .string(s):
+            data += [s.withCString { UnsafePointer($0) }]
+            lengths += [0]                       // Ignored for text parameters
+            formats += [0]
+        case .null:
+            data += [nil]
+            lengths += [0]
+            formats += [0]
+        }
+    }
+    return PGExec(params: count, data: data,
+                  lengths: lengths, formats: formats)
 }
 
 
@@ -504,7 +552,8 @@ let conn = try Connection("")
 let res: [[String?]] = try conn.transaction {
     let row1 = try conn.query("SELECT clock_timestamp(), txid_current()")
     let row2 = try conn.query("SELECT clock_timestamp(), txid_current()")
-    return row1.data() + row2.data()
+    let row3 = try conn.query("SELECT '\\x01'::bytea = $1", [.binary([0x01])])
+    return row1.data() + row2.data() + row3.data()
 }
 
 print("Connection: \(conn.conninfo) \(conn.status().name)")
