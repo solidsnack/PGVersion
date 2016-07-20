@@ -53,10 +53,6 @@ public final class Connection {
         self.init(conninfo, cxn: cxn)
     }
 
-    func query(_ text: String, _ params: [String?] = []) throws -> Rows {
-        return try query(text, params.map { $0.map { .string($0) } ?? .null })
-    }
-
     func query(_ text: String, _ params: [PGParam]) throws -> Rows {
         return try request(Exec.execParams(text, params))
     }
@@ -177,6 +173,33 @@ public final class Connection {
 }
 
 
+extension Connection {
+    func query(_ text: String, _ params: [String?] = []) throws -> Rows {
+        return try query(text, params.map { PGParam.from($0) })
+    }
+
+    func query(_ text: String, _ params: (String?, String?)) throws -> Rows {
+        return try query(text, [PGParam.from(params.0),
+                                PGParam.from(params.1)])
+    }
+
+    func query(_ text: String, _ params: (String?, [UInt8]?)) throws -> Rows {
+        return try query(text, [PGParam.from(params.0),
+                                PGParam.from(params.1)])
+    }
+
+    func query(_ text: String, _ params: ([UInt8]?, String?)) throws -> Rows {
+        return try query(text, [PGParam.from(params.0),
+                                PGParam.from(params.1)])
+    }
+
+    func query(_ text: String, _ params: ([UInt8]?, [UInt8]?)) throws -> Rows {
+        return try query(text, [PGParam.from(params.0),
+                                PGParam.from(params.1)])
+    }
+}
+
+
 public final class Cancel {
     private let canceller: OpaquePointer!
 
@@ -229,6 +252,14 @@ public enum PGParam {
     case binary([UInt8])
     case string(String)
     case null
+
+    public static func from(_ s: String?) -> PGParam {
+        return s.map { .string($0) } ?? .null
+    }
+
+    public static func from(_ b: [UInt8]?) -> PGParam {
+        return b.map { .binary($0) } ?? .null
+    }
 }
 
 
