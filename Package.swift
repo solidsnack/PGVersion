@@ -5,7 +5,7 @@ let v3alpha = Version(3, 0, 0, prereleaseIdentifiers: ["alpha.1"])
 
 
 let package = Package(
-    name: "PGVersion",
+    name: "DispatchPQ",
     dependencies: [
         .Package(url: "https://github.com/solidsnack/CLibPQ.git",
                  majorVersion: 1),
