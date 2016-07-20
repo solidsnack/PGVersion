@@ -12,9 +12,6 @@ import Result
 ///
 /// * A higher-level convenience API for working with a Postgres connection in
 ///   a safe way.
-///
-/// * A statement abstraction, to make it easier to work with prepared
-///   statements and model the database as an API provider.
 
 
 public func libVersion() -> Int32 {
