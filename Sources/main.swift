@@ -56,6 +56,29 @@ public final class Connection {
         self.init(conninfo, cxn: cxn)
     }
 
+    func query(_ text: String, params: [String?] = []) throws -> Rows {
+        return try request(Exec.execParams(text, params))
+    }
+
+    func transaction<T>(block: @noescape () throws -> T) rethrows -> T {
+        return try with {
+            let stat = PQtransactionStatus(cxn)
+            guard let actions = transactionActions(stat: stat) else {
+                throw Error.badConnectionStatus("Transaction: \(stat)")
+            }
+            do {
+                _ = try request(Exec.exec(actions.begin))
+                let data = try block()
+                _ = try request(Exec.exec(actions.end))
+                return data
+            } catch let e {
+                _ = try? request(Exec.exec(actions.rollback))
+                throw e
+            }
+        }
+    }
+
+
     /// Cancel whatever the connection is doing.
     func cancel() throws {
         try cancelToken.cancel()
@@ -379,7 +402,7 @@ public final class Rows {
         return (0..<PQnfields(res)).map { String(cString: PQfname(res, $0)) }
     }
 
-    func rows() -> [[String?]] {
+    func data() -> [[String?]] {
         var data: [[String?]] = []
         for row in 0..<PQntuples(res) {
             var thisRow: [String?] = []
@@ -422,6 +445,8 @@ public enum Error : ErrorProtocol {
     case onRequest(String, sqlState: String)
     /// Error due to library not working right.
     case internalError(String)
+    /// Connection status was non-recoverable.
+    case badConnectionStatus(String)
 
     /// Retrieve error data from connection.
     private static func probe(cxn: OpaquePointer!) -> Error {
@@ -453,6 +478,7 @@ extension ConnStatusType {
     }
 }
 
+
 private func pointerize(_ params: Array<String?> = [])
         -> (Int32, Array<UnsafePointer<Int8>?>) {
     return (Int32(params.count),
@@ -460,9 +486,30 @@ private func pointerize(_ params: Array<String?> = [])
 }
 
 
+private func transactionActions(stat: PGTransactionStatusType)
+    -> (begin: String, end: String, rollback: String)? {
+    switch stat {
+    case PQTRANS_IDLE:
+        return (begin: "BEGIN", end: "END", rollback: "ROLLBACK")
+    case PQTRANS_ACTIVE, PQTRANS_INTRANS:
+        let savepoint = "savepoint_\(arc4random())"
+        return (begin: "SAVEPOINT \(savepoint)",
+                end: "RELEASE SAVEPOINT \(savepoint)",
+                rollback: "ROLLBACK TO SAVEPOINT \(savepoint)")
+    default:
+        return nil
+    }
+}
+
+
 let conn = try Connection("")
-let res: Rows = try conn.request(Exec.exec("SELECT now();"))
+// let res: Rows = try conn.request(Exec.exec("SELECT now();"))
+let res: [[String?]] = try conn.transaction {
+    let row1 = try conn.query("SELECT clock_timestamp(), txid_current()")
+    let row2 = try conn.query("SELECT clock_timestamp(), txid_current()")
+    return row1.data() + row2.data()
+}
 
 print("Connection: \(conn.conninfo) \(conn.status().name)")
-print("Rows: \(res.rows())")
-print("Status: \(res.status.message)")
+print("Rows: \(res)")
+
